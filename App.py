@@ -10,6 +10,7 @@ import torch
 import io
 import altair as alt
 import os
+
 # ─── Config page ─────────────────────────────────────────────────────────
 st.set_page_config(page_title="Gestion des Absences", layout="wide")
 
@@ -107,6 +108,19 @@ c.execute("""
 """)
 conn.commit()
 
+c.execute("""
+    CREATE TABLE IF NOT EXISTS rooms (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        nomclasse TEXT UNIQUE
+    )
+""")
+cols_tt = [r[1] for r in conn.execute("PRAGMA table_info(timetables)").fetchall()]
+if "room_id" not in cols_tt:
+    conn.execute("ALTER TABLE timetables ADD COLUMN room_id INTEGER")
+    # (optionnel) activer les foreign keys
+    conn.execute("PRAGMA foreign_keys = ON")
+conn.commit()
+
 # 2) Migrations éventuelles pour les colonnes manquantes
 student_cols = [r[1] for r in conn.execute("PRAGMA table_info(students)").fetchall()]
 if "first_name" not in student_cols:
@@ -142,88 +156,84 @@ if c.fetchone()[0] == 0:
     """, ("etu1@ocp.com", None, "Étudiant","Un","CNE123","Génie","1ère année", None))
     conn.commit()
 
-# ─── Génération AUTOMATIQUE des alertes ────────────────────────────────────
-# On considère l'année scolaire allant du 1er septembre de l'année en cours
-# jusqu'au 30 juin de l'année suivante.
-
 today = date.today()
 if today.month >= 9:
-    annee_debut = today.year
-    annee_fin = today.year + 1
+    year_start = date(today.year, 9, 1)
+    year_end   = date(today.year + 1, 6, 30)
 else:
-    annee_debut = today.year - 1
-    annee_fin = today.year
+    year_start = date(today.year - 1, 9, 1)
+    year_end   = date(today.year, 6, 30)
 
-start_annee = date(annee_debut, 9, 1).isoformat()
-end_annee   = date(annee_fin, 6, 30).isoformat()
-
-# ─ 3+ absences dans la même matière (hors dimanche, créneaux 8–18)
+# A) ≥3 absences non justifiées dans la même matière
 query_matieres = """
-    SELECT
-      a.student_id,
-      t.subject AS matiere,
-      COUNT(*) AS nb_abs
-    FROM absences a
-    JOIN students s ON a.student_id = s.id
-    JOIN timetables t
-      ON t.filiere = s.filiere
-     AND t.niveau  = s.niveau
-     AND t.slot    = a.hour
-     AND t.day    = CASE strftime('%w', a.date)
-                      WHEN '1' THEN 'Lundi'
-                      WHEN '2' THEN 'Mardi'
-                      WHEN '3' THEN 'Mercredi'
-                      WHEN '4' THEN 'Jeudi'
-                      WHEN '5' THEN 'Vendredi'
-                      WHEN '6' THEN 'Samedi'
-                    END
-    WHERE
-      a.status = 'absent'
-      AND a.justified = 0
-      AND a.date BETWEEN ? AND ?
-      AND strftime('%w', a.date) BETWEEN '1' AND '6'
-      AND a.hour IN ('8–10','10–12','12–14','14–16','16–18')
-    GROUP BY a.student_id, t.subject
-    HAVING COUNT(*) >= 3
+  SELECT
+    a.student_id,
+    t.subject AS matiere,
+    COUNT(*)   AS nb_absences
+  FROM absences a
+  JOIN students s ON a.student_id = s.id
+  JOIN timetables t
+    ON t.filiere = s.filiere
+   AND t.niveau  = s.niveau
+   AND t.slot    = a.hour
+   AND t.day     = CASE strftime('%w', a.date)
+                     WHEN '1' THEN 'Lundi'
+                     WHEN '2' THEN 'Mardi'
+                     WHEN '3' THEN 'Mercredi'
+                     WHEN '4' THEN 'Jeudi'
+                     WHEN '5' THEN 'Vendredi'
+                     WHEN '6' THEN 'Samedi'
+                   END
+  WHERE
+    a.status    = 'absent'
+    AND a.justified = 0
+    AND a.date BETWEEN ? AND ?
+    AND strftime('%w', a.date) BETWEEN '1' AND '6'
+    AND a.hour   IN ('8–10','10–12','12–14','14–16','16–18')
+  GROUP BY a.student_id, t.subject
+  HAVING COUNT(*) >= 3
 """
-rows_matieres = conn.execute(query_matieres, (start_annee, end_annee)).fetchall()
+rows_matieres = conn.execute(query_matieres,
+                              (year_start.isoformat(),
+                               year_end.isoformat())
+                              ).fetchall()
 for student_id, matiere, nb_abs in rows_matieres:
-    msg = f"🚨 Vous avez déjà été absent·e {nb_abs} fois en {matiere} depuis le début de l'année scolaire."
-    existe = conn.execute(
-        "SELECT 1 FROM alerts WHERE student_id=? AND message=? AND viewed=0",
-        (student_id, msg)
-    ).fetchone()
-    if not existe:
+    msg = f"Vous avez manqué {nb_abs} séances en {matiere} depuis le début de l'année scolaire."
+    if not conn.execute(
+            "SELECT 1 FROM alerts WHERE student_id=? AND message=? AND viewed=0",
+            (student_id, msg)
+        ).fetchone():
         conn.execute(
             "INSERT INTO alerts(student_id, message) VALUES(?, ?)",
             (student_id, msg)
         )
 
-# ─ Absence sur les 5 créneaux (8–10,10–12,12–14,14–16,16–18) d’un même lundi–samedi
+# B) Journée complète = 5 créneaux
 query_full_day = """
-    SELECT
-      a.student_id,
-      a.date,
-      COUNT(DISTINCT a.hour) AS cnt_slots
-    FROM absences a
-    JOIN students s ON a.student_id = s.id
-    WHERE
-      a.status = 'absent'
-      AND a.justified = 0
-      AND a.date BETWEEN ? AND ?
-      AND strftime('%w', a.date) BETWEEN '1' AND '6'
-      AND a.hour IN ('8–10','10–12','12–14','14–16','16–18')
-    GROUP BY a.student_id, a.date
-    HAVING cnt_slots = 5
+  SELECT
+    a.student_id,
+    a.date,
+    COUNT(DISTINCT a.hour) AS cnt_slots
+  FROM absences a
+  WHERE
+    a.status     = 'absent'
+    AND a.justified = 0
+    AND a.date  BETWEEN ? AND ?
+    AND strftime('%w', a.date) BETWEEN '1' AND '6'
+    AND a.hour  IN ('8–10','10–12','12–14','14–16','16–18')
+  GROUP BY a.student_id, a.date
+  HAVING cnt_slots = 5
 """
-rows_full_day = conn.execute(query_full_day, (start_annee, end_annee)).fetchall()
-for student_id, day_str, cnt in rows_full_day:
+rows_full_day = conn.execute(query_full_day,
+                             (year_start.isoformat(),
+                              year_end.isoformat())
+                             ).fetchall()
+for student_id, day_str, _ in rows_full_day:
     msg2 = f"⚠️ Vous avez été absent·e toute la journée (5 créneaux) le {day_str}."
-    existe2 = conn.execute(
-        "SELECT 1 FROM alerts WHERE student_id=? AND message=? AND viewed=0",
-        (student_id, msg2)
-    ).fetchone()
-    if not existe2:
+    if not conn.execute(
+            "SELECT 1 FROM alerts WHERE student_id=? AND message=? AND viewed=0",
+            (student_id, msg2)
+        ).fetchone():
         conn.execute(
             "INSERT INTO alerts(student_id, message) VALUES(?, ?)",
             (student_id, msg2)
@@ -238,7 +248,60 @@ if "auth" not in st.session_state:
     st.session_state.auth = False
 
 def login_page():
+    st.markdown("""
+    <style>
+    html, body, .stApp {
+        background-color: #ffffff !important;
+        background-image: url('https://img.freepik.com/photos-premium/arriere-plan-flou-interieur-bibliotheque-etageres-remplies-livres-spate_31965-445904.jpg?semt=ais_hybrid&w=740') !important;
+        background-repeat: no-repeat;
+        background-position: center center;
+        background-size: cover !important;
+        
+        
+        
+    }
+    h1 {
+        text-align: center !important;
+        font-size: 48px !important;
+        margin-bottom: 20px !important;
+        color: black !important;
+    }
+    .stTextInput>div, .stPasswordInput>div {
+        max-width: 300px;
+        margin: 0 auto 10px;
+    }
+    .stTextInput label, .stPasswordInput label {
+        display: block !important;
+        text-align: center !important;
+        margin-bottom: 5px !important;
+        color: black !important;
+    }
+    .stTextInput input, .stPasswordInput input {
+        color: black !important;
+    }
+    .stButton>button {
+        display: block !important;
+        margin: 20px auto !important;
+        background-color: #e47157 !important;
+        color: white !important;
+        border: none !important;
+    }
+    </style>
+    """, unsafe_allow_html=True)
+
+    st.markdown("""
+        <style>
+        .visio-title {
+            font-size: 48px;        /* augmentez cette valeur pour agrandir */
+            font-weight: 700;       /* gras comme le titre */
+            color: #000000;         /* noir foncé */
+            margin: -10px 0 20px 0;  /* remonte légèrement et ajoute un espace en dessous */
+            text-align: center;
+        }
+        </style>
+        """, unsafe_allow_html=True)
     st.title("🔐 Connexion")
+    st.markdown("<div class='visio-title'>VisioIA</div>", unsafe_allow_html=True)
     email = st.text_input("Email", key="login_email")
     pwd   = st.text_input("Mot de passe", type="password", key="login_pwd")
     if st.button("Se connecter"):
@@ -389,14 +452,16 @@ if role == "Admin":
         ]
 
         if filter_hors_creneau:
-            df_abs = df_abs[
+            df_abs1 = df_abs[df_abs["status"] == "absent"]
+            df_abs1 = df_abs[
                 (df_abs["hour"].isin(['8–10','10–12','12–14','14–16','16–18'])) &
                 (pd.to_datetime(df_abs["date"]).dt.weekday <= 5)
             ]
 
         # 3) KPI globaux (Total / Justifiées / Non justifiées)
-        total = len(df_abs)
-        just  = int(df_abs["justified"].sum())
+        df_abs1 = df_abs[df_abs["status"] == "absent"]
+        total = len(df_abs1)
+        just  = int(df_abs1["justified"].sum())
         nonj  = total - just
         col1, col2, col3 = st.columns(3)
         col1.metric("Total absences", total)
@@ -404,8 +469,9 @@ if role == "Admin":
         col3.metric("Absences non justifiées", nonj, f"{nonj/total: .1%}" if total else "—")
 
         # 4) Évolution dans le temps (compte toutes absences)
+        df_abs1 = df_abs[df_abs["status"] == "absent"]
         ts = (
-            df_abs
+            df_abs1
             .groupby("date")
             .size()
             .reset_index(name="count")
@@ -416,7 +482,7 @@ if role == "Admin":
 
         # 5) Par filière et niveau
         st.subheader("Absences par filière")
-        grp_f = df_abs.groupby("filiere").size().reset_index(name="count")
+        grp_f = df_abs1.groupby("filiere").size().reset_index(name="count")
         chart_f = alt.Chart(grp_f).mark_bar().encode(
             x=alt.X("count:Q", title="Nombre"),
             y=alt.Y("filiere:N", sort="-x", title=None),
@@ -425,7 +491,7 @@ if role == "Admin":
         st.altair_chart(chart_f, use_container_width=True)
 
         st.subheader("Absences par niveau")
-        grp_n = df_abs.groupby("niveau").size().reset_index(name="count")
+        grp_n = df_abs1.groupby("niveau").size().reset_index(name="count")
         chart_n = alt.Chart(grp_n).mark_bar().encode(
             x="count:Q",
             y=alt.Y("niveau:N", sort="-x"),
@@ -435,8 +501,9 @@ if role == "Admin":
 
         # 6) Top étudiants absents
         st.subheader("Étudiants les plus absents")
+        df_abs1 = df_abs[df_abs["status"] == "absent"]
         top = (
-            df_abs
+            df_abs1
             .groupby(["student_id", "student"])
             .size()
             .reset_index(name="absences")
@@ -465,10 +532,10 @@ if role == "Admin":
         # 8) Afficher un tableau global des absences entre start_date / end_date
         #    (avec une colonne “Justifiée”)
         st.markdown("---")
-        st.subheader("📋 Liste détaillée des absences (justifiées ou non)")
+        st.subheader(" Liste détaillée des absences (justifiées ou non)")
 
         if not df_abs.empty:
-            df_tableau = df_abs.copy()
+            df_tableau = df_abs1.copy()
             df_tableau["Justifiée"] = df_tableau["justified"].apply(lambda x: "Oui" if x == 1 else "Non")
             df_tableau = df_tableau.rename(columns={
                 "date": "Date",
@@ -542,7 +609,7 @@ if role == "Admin":
         matieres_problematiques = conn.execute(query_matieres, params_mat).fetchall()
 
         for (stud_id, matiere, nb_abs) in matieres_problematiques:
-            message = f"🚨 Vous avez manqué {nb_abs} séances en {matiere} entre {start_date} et {end_date} (non justifiées)."
+            message = f" Vous avez manqué {nb_abs} séances en {matiere} entre {start_date} et {end_date} (non justifiées)."
             déjà = conn.execute(
                 "SELECT 1 FROM alerts WHERE student_id = ? AND message = ? AND viewed = 0",
                 (stud_id, message)
@@ -620,8 +687,8 @@ if role == "Admin":
 
     # ───  GESTION des ÉTUDIANTS (Admin) ─────────────────────────────────────
     with tabs[1]:
-        st.header("👥 Gestion des Étudiants")
-        st.subheader("➕ Ajouter un étudiant")
+        st.header(" Gestion des Étudiants")
+        st.subheader(" Ajouter un étudiant")
 
         col1, col2 = st.columns(2)
         with col1:
@@ -630,8 +697,11 @@ if role == "Admin":
             em = st.text_input("Email",   key="std_em")
             cne = st.text_input("CNE",    key="std_cne")
         with col2:
-            fil = st.text_input("Filière", key="std_fil")
-            niv = st.text_input("Niveau",  key="std_niv")
+            FILIERES = ["DSI", "SRI"]
+            NIVEAUX  = ["1ère année", "2ème année"]
+
+            fil = st.selectbox("Filière", FILIERES, key="std_fil")
+            niv = st.selectbox("Niveau", NIVEAUX, key="std_niv")
             photo_file = st.file_uploader("Photo JPG/PNG", type=["jpg","jpeg","png"], key="std_ph")
 
         if st.button("Ajouter un étudiant"):
@@ -719,8 +789,8 @@ if role == "Admin":
 
     # ───  GESTION des ENSEIGNANTS (Admin) ───────────────────────────────────
     with tabs[2]:
-        st.header("👤 Gestion des Enseignants")
-        st.subheader("➕ Ajouter un enseignant")
+        st.header(" Gestion des Enseignants")
+        st.subheader(" Ajouter un enseignant")
         tfn = st.text_input("Prénom", key="t_fn")
         tln = st.text_input("Nom",     key="t_ln")
         tem = st.text_input("Email",   key="t_em")
@@ -746,20 +816,20 @@ if role == "Admin":
 
     # ───  VALIDATION des JUSTIFICATIFS ──────────────────────────────────────
     with tabs[3]:
-        st.header("📑 Validation des justificatifs & justification manuelle")
+        st.header("Validation des justificatifs & justification manuelle")
 
-        # 1) Partie existante : Justificatifs en attente
+        # Chargement de tous les justificatifs non nuls
         dfj = pd.read_sql("""
             SELECT
-              a.id,
-              a.date,
-              a.hour,
-              a.justificatif,
-              a.justified,
-              s.first_name,
-              s.last_name,
-              s.filiere,
-              s.niveau
+            a.id,
+            a.date,
+            a.hour,
+            a.justificatif,
+            a.justified,
+            s.first_name,
+            s.last_name,
+            s.filiere,
+            s.niveau
             FROM absences a
             JOIN students s ON a.student_id = s.id
             WHERE a.justificatif IS NOT NULL
@@ -769,13 +839,28 @@ if role == "Admin":
         pending = dfj[dfj["justified"] == 0]
         done    = dfj[dfj["justified"] == 1]
 
+        # — Justificatifs en attente —
         if not pending.empty:
-            st.subheader("🕒 Justificatifs en attente")
+            st.subheader(" Justificatifs en attente")
             for _, r in pending.iterrows():
                 st.markdown(
                     f"**{r.first_name} {r.last_name}** — *{r.filiere} / {r.niveau}* — {r.date} ・ {r.hour}"
                 )
-                st.write(f"[Voir justificatif]({r.justificatif})")
+                # Nouveau : bouton de téléchargement
+                path = r.justificatif
+                try:
+                    with open(path, "rb") as f:
+                        data = f.read()
+                    st.download_button(
+                        label="📄 Télécharger le justificatif",
+                        data=data,
+                        file_name=os.path.basename(path),
+                        key=f"download_done_{r.id}" ,
+                        mime="application/pdf"
+                    )
+                except FileNotFoundError:
+                    st.error("Fichier introuvable !")
+
                 c1, c2 = st.columns(2)
                 with c1:
                     if st.button("Valider justificatif", key=f"val_doc_{r.id}"):
@@ -790,20 +875,33 @@ if role == "Admin":
         else:
             st.info("Aucun justificatif en attente.")
 
+        # — Justificatifs déjà validés —
         if not done.empty:
             st.subheader("✅ Justificatifs validés")
             for _, r in done.iterrows():
                 st.markdown(
                     f"**{r.first_name} {r.last_name}** — *{r.filiere} / {r.niveau}* — {r.date} ・ {r.hour} — ✅ Validé"
                 )
-                st.write(f"[Voir justificatif]({r.justificatif})")
+                path = r.justificatif
+                try:
+                    with open(path, "rb") as f:
+                        data = f.read()
+                    st.download_button(
+                        label="📄 Télécharger le justificatif",
+                        data=data,
+                        file_name=os.path.basename(path),
+                        mime="application/pdf",
+                        key=f"done_doc_{r.id}"
+                    )
+                except FileNotFoundError:
+                    st.error("Fichier introuvable !")
         else:
             st.info("Aucun justificatif déjà validé.")
 
         st.markdown("---")
 
         # 2) Partie “Justifier MANUELLEMENT” — tout dans un seul tableau
-        st.subheader("✍️ Justifier MANUELLEMENT une absence (sans fichier)")
+        st.subheader(" Justifier MANUELLEMENT une absence (sans fichier)")
 
         df_nonjust = pd.read_sql("""
             SELECT
@@ -857,7 +955,7 @@ if role == "Admin":
 
         st.markdown(
             """
-            > 🔍 **Conseil** : Vous pouvez filtrer directement dans le tableau !  
+            >  **Conseil** : Vous pouvez filtrer directement dans le tableau !  
             > · Cliquez sur l’icône d’entonnoir dans l’en-tête de la colonne **filiere**,  
             >   **niveau**, ou **Étudiant**, pour n’afficher que les lignes souhaitées.  
             > · Cochez la colonne **Justifier ✅** pour chaque absence à justifier,  
@@ -867,7 +965,10 @@ if role == "Admin":
 
     # ───  GESTION des EMPLOIS DE TEMPS (Admin) ─────────────────────────────
     with tabs[4]:
-        st.header("🗓️ Gestion des emplois du temps")
+    
+        st.header(" Gestion des emplois du temps")
+
+        # --- Style des colonnes ---
         st.markdown("""
         <style>
         [data-testid="column"] {
@@ -880,92 +981,114 @@ if role == "Admin":
         </style>
         """, unsafe_allow_html=True)
 
-        # Chargement des enseignants
+        # 1) Charger la liste des professeurs
         df_profs = pd.read_sql(
             "SELECT u.name FROM users u JOIN teachers t ON u.email=t.email",
             conn
         )
-        if df_profs.empty:
-            st.warning("⚠️ Aucun enseignant enregistré. Merci d’ajouter des professeurs avant de créer un emploi du temps.")
-        else:
-            profs = df_profs["name"].tolist()
+        profs = df_profs["name"].tolist()
+        if not profs:
+            st.warning("Aucun enseignant enregistré. Merci d’ajouter des professeurs.")
+            
 
-            # Sélecteurs Filière / Niveau
-            filieres = [
-                f or "Non renseignée"
-                for f in pd.read_sql("SELECT DISTINCT filiere FROM students", conn)["filiere"]
-            ]
-            niveaux = ["1ère année", "2ème année"]
-            sel_fil = st.selectbox("Filière", sorted(set(filieres)), key="edt_fil")
-            sel_niv = st.selectbox("Niveau", niveaux,                 key="edt_niv")
+        # 2) Sélecteurs Filière / Niveau
+        filieres = pd.read_sql("SELECT DISTINCT filiere FROM students", conn)["filiere"] \
+                    .fillna("Non renseignée").tolist()
+        niveaux  = ["1ère année", "2ème année"]
+        sel_fil  = st.selectbox("Filière", sorted(set(filieres)))
+        sel_niv  = st.selectbox("Niveau", niveaux)
 
-            # Définition des jours et créneaux
-            days  = ["Lundi", "Mardi", "Mercredi", "Jeudi", "Vendredi"]
-            slots = ["8–10", "10–12", "12–14", "14–16", "16–18"]
+        # 3) Récupérer les plannings existants (y compris room_id)
+        days  = ["Lundi","Mardi","Mercredi","Jeudi","Vendredi","Samedi"]
+        slots = ["8–10","10–12","12–14","14–16","16–18"]
+        df_exist = pd.read_sql(
+            "SELECT day, slot, subject, teacher, room_id FROM timetables "
+            "WHERE filiere=? AND niveau=?",
+            conn, params=(sel_fil, sel_niv)
+        )
+        prepop = {
+            (r["day"], r["slot"]): (r["subject"], r["teacher"], r["room_id"])
+            for _, r in df_exist.iterrows()
+        }
+        # Map room_id → nomclasse
+        df_rooms = pd.read_sql("SELECT id, nomclasse FROM rooms", conn)
+        rooms_map = dict(zip(df_rooms["id"], df_rooms["nomclasse"]))
 
-            # Pré-remplissage si existant
-            df_exist = pd.read_sql(
-                "SELECT day, slot, subject, teacher FROM timetables WHERE filiere=? AND niveau=?",
-                conn, params=(sel_fil, sel_niv)
-            )
-            prepop = {
-                (r["day"], r["slot"]): (r["subject"], r["teacher"])
-                for _, r in df_exist.iterrows()
-            }
+        # 4) Construction du tableau : Matière / Prof / Salle (texte libre)
+        st.markdown("**Double-cliquez sur chaque case pour modifier :**")
+        header = st.columns(len(slots)+1)
+        header[0].markdown("**Jour \\ Créneau**")
+        for i, slot in enumerate(slots, start=1):
+            header[i].markdown(f"**{slot}**")
 
-            st.markdown("**Double-cliquez sur chaque case pour saisir :**  \n`Matière` puis `Professeur`")
-
-            # Affichage de la grille
-            header_cols = st.columns(len(slots) + 1)
-            header_cols[0].markdown("**Jour \\ Créneau**")
+        subj_vals, prof_vals, room_vals = {}, {}, {}
+        for day in days:
+            row = st.columns(len(slots)+1)
+            row[0].markdown(f"**{day}**")
             for i, slot in enumerate(slots, start=1):
-                header_cols[i].markdown(f"**{slot}**")
+                key_subj = f"tt_{sel_fil}_{sel_niv}_{day}_{slot}_subj"
+                key_prof = f"tt_{sel_fil}_{sel_niv}_{day}_{slot}_prof"
+                key_room = f"tt_{sel_fil}_{sel_niv}_{day}_{slot}_room"
 
-            subj_vals, prof_vals = {}, {}
+                init_subj, init_prof, init_room_id = "", "", None
+                if (day, slot) in prepop:
+                    init_subj, init_prof, init_room_id = prepop[(day, slot)]
+                init_room = rooms_map.get(init_room_id, "")
+
+                with row[i]:
+                    subj_vals[(day, slot)] = st.text_input(
+                        "", value=init_subj, key=key_subj,
+                        placeholder="Matière", label_visibility="collapsed"
+                    )
+                    prof_vals[(day, slot)] = st.selectbox(
+                        "", options=[""] + profs,
+                        index=(profs.index(init_prof) + 1 if init_prof in profs else 0),
+                        key=key_prof, label_visibility="collapsed"
+                    )
+                    room_vals[(day, slot)] = st.text_input(
+                        "", value=init_room, key=key_room,
+                        placeholder="Salle", label_visibility="collapsed"
+                    )
+
+        # 5) Enregistrer le planning + salles
+        if st.button("Enregistrer l’emploi du temps"):
+            conn.execute(
+                "DELETE FROM timetables WHERE filiere=? AND niveau=?",
+                (sel_fil, sel_niv)
+            )
             for day in days:
-                row_cols = st.columns(len(slots) + 1)
-                row_cols[0].markdown(f"**{day}**")
-                for j, slot in enumerate(slots, start=1):
-                    key_subj = f"tt_{sel_fil}_{sel_niv}_{day}_{slot}_subj"
-                    key_prof = f"tt_{sel_fil}_{sel_niv}_{day}_{slot}_prof"
-                    init_subj, init_prof = prepop.get((day, slot), ("", ""))
+                for slot in slots:
+                    mat = subj_vals[(day, slot)].strip()
+                    prof = prof_vals[(day, slot)].strip()
+                    raw = room_vals.get((day, slot))
+                    salle = raw.strip() if isinstance(raw, str) else ""
 
-                    with row_cols[j]:
-                        subj_vals[(day, slot)] = st.text_input(
-                            "", value=init_subj, key=key_subj,
-                            placeholder="Matière", label_visibility="collapsed"
+                    room_id = None
+                    if salle:
+                        conn.execute(
+                            "INSERT OR IGNORE INTO rooms(nomclasse) VALUES(?)",
+                            (salle,)
                         )
-                        prof_vals[(day, slot)] = st.selectbox(
-                            "", options=[""] + profs, index=0,
-                            key=key_prof, label_visibility="collapsed"
-                        )
+                        room_id = conn.execute(
+                            "SELECT id FROM rooms WHERE nomclasse=?",
+                            (salle,)
+                        ).fetchone()[0]
 
-            if st.button("Enregistrer l’emploi du temps"):
-                conn.execute(
-                    "DELETE FROM timetables WHERE filiere=? AND niveau=?", 
-                    (sel_fil, sel_niv)
-                )
-                for day in days:
-                    for slot in slots:
-                        subj = subj_vals[(day, slot)].strip()
-                        prof = prof_vals[(day, slot)].strip()
-                        if subj or prof:
-                            conn.execute(
-                                """
-                                INSERT INTO timetables
-                                  (filiere, niveau, day, slot, subject, teacher)
-                                VALUES (?, ?, ?, ?, ?, ?)
-                                """,
-                                (sel_fil, sel_niv, day, slot, subj, prof)
-                            )
-                conn.commit()
-                st.success("Emploi du temps sauvegardé ✅")
+                    if mat or prof or room_id:
+                        conn.execute("""
+                            INSERT INTO timetables
+                            (filiere, niveau, day, slot, subject, teacher, room_id)
+                            VALUES (?, ?, ?, ?, ?, ?, ?)
+                        """, (sel_fil, sel_niv, day, slot, mat, prof, room_id))
+
+            conn.commit()
+            st.success("Emploi du temps et salles enregistrés ✅")
 
 
     # ───  PARAMÈTRES (Admin) ─────────────────────────────────────────────────
     with tabs[5]:
         st.header("⚙️ Paramètres")
-        st.subheader("🔑 Réinitialiser mot de passe")
+        st.subheader(" Réinitialiser mot de passe")
         df_users = pd.read_sql("SELECT email, role FROM users", conn)
         sel_user = st.selectbox("Utilisateur", df_users['email'], key='pwd_user')
         new_pwd  = st.text_input("Nouveau mot de passe", type="password", key='new_pwd')
@@ -978,7 +1101,7 @@ if role == "Admin":
                 st.warning("Entrez un nouveau mot de passe.")
 
         st.markdown("---")
-        st.subheader("🗑️ Supprimer un utilisateur")
+        st.subheader(" Supprimer un utilisateur")
         df_del = pd.read_sql("SELECT email, role FROM users WHERE role!='Admin'", conn)
         sel_del = st.selectbox("Sélectionnez l'utilisateur à supprimer", df_del['email'], key='del_user')
         if st.button("Supprimer l'utilisateur"):
@@ -993,7 +1116,7 @@ if role == "Admin":
             st.rerun()
 
         st.markdown("---")
-        st.subheader("✏️ Modifier un étudiant")
+        st.subheader(" Modifier un étudiant")
         df_std = pd.read_sql("SELECT email, first_name, last_name, cne, filiere, niveau FROM students", conn)
         if not df_std.empty:
             sel_std = st.selectbox("Choisir un étudiant", df_std['email'], key='mod_std')
@@ -1016,7 +1139,7 @@ if role == "Admin":
             st.info("Aucun étudiant à modifier.")
 
         st.markdown("---")
-        st.subheader("✏️ Modifier un enseignant")
+        st.subheader(" Modifier un enseignant")
         df_te = pd.read_sql(
             "SELECT t.email, u.name FROM teachers t JOIN users u ON t.email=u.email",
             conn
@@ -1231,7 +1354,7 @@ elif role == "Enseignant":
             st.info("Aucune donnée d’absence pour cette période.")
 
         # ─── Liste des absences récentes (limité à 20) ───────────────────────
-        st.subheader("📋 Absences récentes")
+        st.subheader(" Absences récentes")
         df_recent = pd.read_sql(
             """
             SELECT
@@ -1273,7 +1396,7 @@ elif role == "Enseignant":
 
     # ─── ENSEIGNANT: APPEL MANUEL ─────────────────────────────────────────
     with tabs[1]:
-        st.header("✏️ Appel Manuel par Heure")
+        st.header(" Appel Manuel par Heure")
         call_date = st.date_input("Date de l'appel", value=date.today(), key="call_date")
 
         filieres = (
@@ -1466,11 +1589,22 @@ elif role == "Enseignant":
                     else:
                         # Insert en base uniquement si le créneau/jour est valide
                         for sid, stat in status_map.items():
-                            exists = conn.execute(
-                                "SELECT 1 FROM absences WHERE student_id=? AND date=? AND hour=?",
+                            # on cherche l'absence existante pour cet étudiant / date / créneau
+                            row = conn.execute(
+                                "SELECT id, status FROM absences WHERE student_id=? AND date=? AND hour=?",
                                 (sid, date_str, slot)
                             ).fetchone()
-                            if not exists:
+
+                            if row:
+                                abs_id, old_status = row
+                                # si le statut a changé, on met à jour
+                                if old_status != stat:
+                                    conn.execute(
+                                        "UPDATE absences SET status=?, justified=0 WHERE id=?",
+                                        (stat, abs_id)
+                                    )
+                            else:
+                                # pas d'enregistrement, on insère
                                 conn.execute(
                                     """
                                     INSERT INTO absences
@@ -1479,6 +1613,7 @@ elif role == "Enseignant":
                                     """,
                                     (sid, date_str, slot, stat)
                                 )
+
                         conn.commit()
                         n_pres = sum(1 for s in status_map.values() if s == "present")
                         n_abs = sum(1 for s in status_map.values() if s == "absent")
@@ -1493,63 +1628,60 @@ elif role == "Enseignant":
                         for _, row in df_studs.iterrows()
                     ]
                     df_report = pd.DataFrame(report)
-                    st.markdown("### 📋 Bilan de l’appel")
+                    st.markdown("###  Bilan de l’appel")
                     st.dataframe(df_report, use_container_width=True)
 
 
     # ─── ENSEIGNANT: MES CLASSES ────────────────────────────────────────────
     with tabs[3]:
-        st.header("📚 Mes classes")
-        teacher_name = st.session_state.name
+        st.header(" Mes classes")
 
-        st.markdown("Mon emploi du temps")
+        # Récupérer emploi du temps + salle
         df_tt = pd.read_sql(
             """
-            SELECT day, slot, subject, filiere, niveau
-            FROM timetables
-            WHERE teacher = ?
+            SELECT
+            t.day,
+            t.slot,
+            t.subject,
+            t.teacher,
+            r.nomclasse AS salle
+            FROM timetables t
+            LEFT JOIN rooms r ON t.room_id = r.id
+            WHERE t.teacher = ?
             """,
             conn,
             params=(teacher_name,)
         )
+
         if df_tt.empty:
             st.info(f"Aucun cours trouvé pour {teacher_name}.")
         else:
+            # Construire la cellule HTML : Matière + enseignant + Salle
             df_tt["cell"] = df_tt.apply(
-                lambda r: f"**{r.subject}**<br><small>{r.filiere} – {r.niveau}</small>",
+                lambda r: f"**{r.subject}**<br><small>Salle : {r.salle or '—'}</small>",
                 axis=1
             )
             pivot = (
                 df_tt
                 .pivot(index="day", columns="slot", values="cell")
                 .reindex(
-                    index=["Lundi", "Mardi", "Mercredi", "Jeudi", "Vendredi"],
-                    columns=["8–10", "10–12", "12–14", "14–16", "16–18"]
+                    index=["Lundi","Mardi","Mercredi","Jeudi","Vendredi","Samedi"],
+                    columns=["8–10","10–12","12–14","14–16","16–18"]
                 )
                 .fillna("")
             )
+
+            # Style tableau
             st.markdown("""
-                <style>
-                table {
-                  width: 100%;
-                  border-collapse: collapse;
-                }
-                th, td {
-                  border: 1px solid #ddd;
-                  padding: 8px;
-                  vertical-align: top;
-                }
-                th {
-                  background-color: #f5f5f5;
-                  text-align: center;
-                }
-                td {
-                  white-space: normal;
-                }
-                </style>
+            <style>
+            table { width:100%; border-collapse:collapse; }
+            th, td { border:1px solid #ddd; padding:8px; vertical-align:top; }
+            th { background:#f5f5f5; text-align:center; }
+            td { white-space:normal; }
+            </style>
             """, unsafe_allow_html=True)
-            html = pivot.to_html(escape=False)
-            st.markdown(html, unsafe_allow_html=True)
+
+            st.markdown(pivot.to_html(escape=False), unsafe_allow_html=True)
 
         st.markdown("Liste des étudiants")
         df_classes = pd.read_sql(
@@ -1599,7 +1731,7 @@ elif role == "Enseignant":
 
         # ─── Historique des absences COMPLET pour ce prof (toutes celles de ses matières) ───
         st.markdown("---")
-        st.subheader("📜 Historique COMPLET des absences pour mes matières")
+        st.subheader(" Historique COMPLET des absences pour mes matières")
 
         df_history = pd.read_sql(
             """
@@ -1662,7 +1794,7 @@ else:
     """, unsafe_allow_html=True)   
 
     with tabs[0]:
-        st.header("📝 Mes absences")
+        st.header(" Mes absences")
 
         # 1) Récupérer l’ID de l’étudiant connecté
         row = conn.execute(
@@ -1690,7 +1822,7 @@ else:
         )
 
         if not df_alerts.empty:
-            st.subheader("🔔 Mes alertes")
+            st.subheader(" Mes alertes")
             for r in df_alerts.itertuples():
                 st.markdown(f"- **{r.created_at}** : {r.message}")
                 if st.button(f"Marquer l’alerte #{r.id} comme lue", key=f"ack_{r.id}"):
@@ -1721,57 +1853,76 @@ else:
             st.dataframe(df_a, use_container_width=True)
 
     with tabs[1]:
-        st.header("📂 Soumettre justificatif")
+        st.header(" Soumettre justificatif")
         d0 = st.date_input("Date absence", value=date.today())
         file = st.file_uploader("Justificatif (jpg/png/pdf)", type=["jpg","png","pdf"])
         if st.button("Soumettre"):
-            if not file:
-                st.warning("Uploader un justificatif.")
-            else:
-                os.makedirs("justifs", exist_ok=True)
-                path = f"justifs/{email}_{d0}.pdf"
+            if file:
+                ext = file.name.split('.')[-1]                         # jpg, png ou pdf
+                JUSTIF_DIR = os.path.join(os.path.dirname(__file__), "justifs")
+                os.makedirs(JUSTIF_DIR, exist_ok=True)
+                filename = f"{email}_{d0}.{ext}"                       # conserver l’extension
+                path = os.path.join(JUSTIF_DIR, filename)
                 with open(path, "wb") as f:
                     f.write(file.getbuffer())
+                # stocker path dans la BD
                 conn.execute("""
-                    INSERT OR IGNORE INTO absences(student_id,date,status,justificatif,hour)
-                    VALUES((SELECT id FROM students WHERE email=?),?,?,?,NULL)
-                """, (email, d0.isoformat(), "absent", path))
+                    UPDATE absences
+                    SET justificatif = ?
+                    WHERE student_id=(SELECT id FROM students WHERE email=?)
+                    AND date=? 
+                """, (path, email, d0.isoformat()))
                 conn.commit()
                 st.success("Justificatif soumis.")
 
-    with tabs[2]:
-        st.header("📅 Mon emploi du temps")
 
+    with tabs[2]:
+        st.header(" Mon emploi du temps")
+
+        # Récupérer filière/niveau de l’étudiant
         row = conn.execute(
             "SELECT filiere, niveau FROM students WHERE email=?",
             (email,)
         ).fetchone()
         if not row or not row[0] or not row[1]:
-            st.error("Votre profil est incomplet : filière ou niveau manquant.")
+            st.error("Profil incomplet : filière ou niveau manquant.")
             
         etu_fil, etu_niv = row
 
+        # Charger emploi du temps + salle
         df_tt = pd.read_sql(
             """
-            SELECT day, slot, subject, teacher
-            FROM timetables
-            WHERE filiere=? AND niveau=?
+            SELECT
+            t.day,
+            t.slot,
+            t.subject,
+            t.teacher,
+            r.nomclasse AS salle
+            FROM timetables t
+            LEFT JOIN rooms r ON t.room_id = r.id
+            WHERE t.filiere = ? AND t.niveau = ?
             """,
-            conn, params=(etu_fil, etu_niv)
+            conn,
+            params=(etu_fil, etu_niv)
         )
 
         if df_tt.empty:
             st.info("Votre emploi du temps n'est pas encore défini.")
         else:
+            # Construire la cellule texte : Matière, enseignant, Salle
             df_tt["cell"] = df_tt.apply(
-                lambda r: f"{r.subject}\n{r.teacher}".strip(), axis=1
+                lambda r: f"{r.subject}\n{r.teacher}\n {r.salle or '—'}",
+                axis=1
             )
             pivot = (
                 df_tt
                 .pivot(index="day", columns="slot", values="cell")
-                .reindex(index=["Lundi","Mardi","Mercredi","Jeudi","Vendredi"],
-                         columns=["8–10","10–12","12–14","14–16","16–18"])
+                .reindex(
+                    index=["Lundi","Mardi","Mercredi","Jeudi","Vendredi","Samedi"],
+                    columns=["8–10","10–12","12–14","14–16","16–18"]
+                )
             )
+
             st.dataframe(
                 pivot.fillna(""),
                 use_container_width=True,
