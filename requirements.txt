@@ -1,0 +1,12 @@
+streamlit
+sqlite3
+pandas
+numpy
+cv2
+datetime
+facenet_pytorch
+PIL
+torch
+io
+altair
+os
